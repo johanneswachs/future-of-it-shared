@@ -334,22 +334,181 @@ def list_all_branches(repo_path: str) -> List[str]:
     branches = [b for b in branches if b != "origin/HEAD"]
     return branches
 
+def get_branches_sorted_by_date(repo_path: str) -> List[Tuple[str, Optional[datetime]]]:
+    """
+    Get all branches sorted by last commit date (newest first).
+    Returns list of (branch_name, last_commit_date) tuples.
+    """
+    # Get branches with their last commit date, sorted by date descending
+    out = run([
+        "git", "for-each-ref",
+        "--sort=-committerdate",
+        "--format=%(refname:short)|%(committerdate:iso-strict)",
+        "refs/heads", "refs/remotes/origin"
+    ], cwd=repo_path)
+
+    branches = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("|", 1)
+        branch_name = parts[0].strip()
+        if branch_name == "origin/HEAD":
+            continue
+
+        commit_date = None
+        if len(parts) == 2 and parts[1].strip():
+            try:
+                commit_date = datetime.fromisoformat(parts[1].strip())
+                if commit_date.tzinfo is None:
+                    commit_date = commit_date.replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+
+        branches.append((branch_name, commit_date))
+
+    return branches
+
+
+def get_oldest_commit_date(repo_path: str, commit_shas: List[str]) -> Optional[datetime]:
+    """Get the date of the oldest commit in the list."""
+    if not commit_shas:
+        return None
+
+    # Get dates for all commits in one call
+    cmd = ["git", "log", "--format=%H|%ad", "--date=iso-strict", "--no-walk"] + commit_shas[:1000]  # Limit to avoid arg list too long
+    out = run(cmd, cwd=repo_path)
+
+    oldest_date = None
+    for line in out.splitlines():
+        if "|" not in line:
+            continue
+        _, date_str = line.split("|", 1)
+        try:
+            commit_date = datetime.fromisoformat(date_str.strip())
+            if commit_date.tzinfo is None:
+                commit_date = commit_date.replace(tzinfo=timezone.utc)
+            if oldest_date is None or commit_date < oldest_date:
+                oldest_date = commit_date
+        except ValueError:
+            continue
+
+    return oldest_date
+
+
+def get_branches_for_commits_incremental(
+    repo_path: str,
+    new_commit_shas: Set[str],
+) -> Dict[str, List[str]]:
+    """
+    Get branch mapping for new commits by processing branches in date order.
+
+    Strategy:
+    - Process branches from newest to oldest (most recent activity first)
+    - For each branch, run git rev-list and collect branch info only for new commits
+    - Stop when branch's last commit is older than our oldest new commit
+      (such branches cannot contain any new commits)
+    """
+    if not new_commit_shas:
+        return {}
+
+    # Get branches sorted by date
+    print(f"  Getting branches sorted by activity date...")
+    branches = get_branches_sorted_by_date(repo_path)
+    total_branches = len(branches)
+
+    # Get oldest new commit date for cutoff
+    print(f"  Finding oldest new commit date...")
+    oldest_new_commit_date = get_oldest_commit_date(repo_path, list(new_commit_shas)[:1000])
+
+    # Find cutoff index - first branch older than our oldest new commit
+    branches_to_process = total_branches
+    if oldest_new_commit_date:
+        print(f"  Oldest new commit: {oldest_new_commit_date.isoformat()}")
+        for i, (branch_name, branch_date) in enumerate(branches):
+            if branch_date and branch_date < oldest_new_commit_date:
+                branches_to_process = i
+                break
+
+    branches_skipped = total_branches - branches_to_process
+    print(f"  Will process {branches_to_process} branches (skipping {branches_skipped} older branches)")
+
+    sha_to_branches: Dict[str, List[str]] = defaultdict(list)
+    commits_found = 0
+
+    BRANCH_LOG_INTERVAL = 50
+
+    for i in range(branches_to_process):
+        branch_name, branch_date = branches[i]
+
+        if i > 0 and i % BRANCH_LOG_INTERVAL == 0:
+            print(f"    Processing branches: {i}/{branches_to_process} ({commits_found} commit-branch mappings)", flush=True)
+
+        # Get commits for this branch
+        try:
+            out = run(["git", "rev-list", branch_name], cwd=repo_path)
+            for sha in out.splitlines():
+                if sha and sha in new_commit_shas:
+                    sha_to_branches[sha].append(branch_name)
+                    commits_found += 1
+        except Exception as e:
+            print(f"    Warning: failed to process branch {branch_name}: {e}")
+            continue
+
+    print(f"    Processing branches: {branches_to_process}/{branches_to_process} - done")
+    print(f"  Commits with branch info: {len(sha_to_branches)}/{len(new_commit_shas)}")
+
+    return dict(sha_to_branches)
+
+
+def get_all_commits_and_count_branches(repo_path: str) -> Tuple[List[str], int]:
+    """Get all commits reachable from any ref, and count of branches."""
+    print(f"  Getting all commits (git rev-list --all)...")
+    out = run(["git", "rev-list", "--all"], cwd=repo_path)
+    all_unique = [s for s in out.splitlines() if s]
+
+    # Count branches
+    branch_out = run([
+        "git", "for-each-ref",
+        "--format=%(refname:short)",
+        "refs/heads", "refs/remotes/origin"
+    ], cwd=repo_path)
+    branches = [b for b in branch_out.splitlines() if b.strip() and b.strip() != "origin/HEAD"]
+
+    print(f"  Found {len(all_unique)} commits across {len(branches)} branches")
+    return all_unique, len(branches)
+
+
 def commits_by_branch(repo_path: str, branches: Iterable[str]) -> Tuple[Dict[str, List[str]], List[str]]:
     """
     Build a mapping from commit SHA -> list of branch names that contain it,
     and return a deduped list of all commits reachable from all refs (git rev-list --all).
     """
+    branches_list = list(branches)
+    total_branches = len(branches_list)
+    print(f"  Building branch-commit mapping for {total_branches} branches...")
+
     sha_to_branches: Dict[str, List[str]] = defaultdict(list)
-    for br in branches:
+
+    # Process branches in batches for progress reporting
+    BRANCH_LOG_INTERVAL = 50
+    for i, br in enumerate(branches_list):
+        if i > 0 and i % BRANCH_LOG_INTERVAL == 0:
+            print(f"    Processing branches: {i}/{total_branches}", flush=True)
+
         out = run(["git", "rev-list", br], cwd=repo_path)
         for sha in out.splitlines():
             if sha:
                 sha_to_branches[sha].append(br)
 
+    print(f"    Processing branches: {total_branches}/{total_branches} - done")
+
     # Use the full all-refs traversal order; do NOT restrict to seen SHAs.
+    print(f"  Getting all commits (git rev-list --all)...")
     all_unique = run(["git", "rev-list", "--all"], cwd=repo_path).splitlines()
     # keep only real SHAs (defensive, though rev-list emits SHAs)
     all_unique = [s for s in all_unique if s]
+    print(f"  Found {len(all_unique)} total commits across all refs")
     return sha_to_branches, all_unique
 
 def parse_numstat(repo_path: str, sha: str):
@@ -711,17 +870,19 @@ def main():
                     print(f"  failed to checkout default branch '{repo.default_branch}', repository may be empty")
                     continue
 
-            branch_map, all_commits = commits_by_branch(repo_path, local_branches)
-
-            # Double-check: if no commits found, skip
-            if not all_commits:
-                print(f"  no commits found in repository, skipping")
-                continue
-
-            # Filter to only new commits if incremental
+            # OPTIMIZATION: For incremental mode, get commits first, then use smart branch mapping
             if is_incremental:
+                # Fast path: get all commits and branch count first
+                all_commits, branch_count = get_all_commits_and_count_branches(repo_path)
+
+                if not all_commits:
+                    print(f"  no commits found in repository, skipping")
+                    continue
+
                 new_commits = [sha for sha in all_commits if sha not in existing_shas]
-                print(f"  found {len(new_commits)} new commits (out of {len(all_commits)} total)")
+                new_commits_set = set(new_commits)
+                print(f"  Found {len(new_commits)} new commits (out of {len(all_commits)} total, {branch_count} branches)")
+
                 if not new_commits:
                     # Write empty file to staging to mark as processed
                     pd.DataFrame(columns=["repo", "sha", "author.name", "author.email", "commit.author.date",
@@ -729,8 +890,21 @@ def main():
                                          "deletions", "total_changes", "changed_files"]).to_csv(commits_staging_file, index=False)
                     print(f"  Staged empty delta (no new commits)")
                     continue
+
                 commits_to_process = new_commits
+
+                # Use incremental branch mapping: process branches by date, stop at old branches
+                # This is efficient because new commits are likely on recently active branches
+                branch_map = get_branches_for_commits_incremental(repo_path, new_commits_set)
             else:
+                # Full fetch: need complete branch mapping
+                branch_map, all_commits = commits_by_branch(repo_path, local_branches)
+
+                # Double-check: if no commits found, skip
+                if not all_commits:
+                    print(f"  no commits found in repository, skipping")
+                    continue
+
                 commits_to_process = all_commits
 
             # Batch process commit data in chunks
