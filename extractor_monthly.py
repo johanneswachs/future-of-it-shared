@@ -135,6 +135,11 @@ class GitCommitAnalyzer:
         return list(latest_by_week.values())  # newest weeks first
 
     # ------------ file helpers ------------
+    def get_commit_date(self, sha: str) -> str:
+        """Get commit author date in ISO format for a given SHA."""
+        out = run(["git", "log", "-1", "--format=%aI", sha], cwd=self.repo_path)
+        return out.strip()
+
     def list_files_at_commit(self, sha: str) -> List[str]:
         out = run(["git", "ls-tree", "-r", "--name-only", sha], cwd=self.repo_path)
         return [ln.strip() for ln in out.splitlines() if ln.strip()]
@@ -237,8 +242,10 @@ class GitCommitAnalyzer:
         for i, sha in enumerate(commits, 1):
             print(f"\r[deps] processed {i}/{total} commits...", end="", flush=True)
             res = self.analyze_commit(sha)
+            commit_date = self.get_commit_date(sha)
             results.append({
                 "sha": res.sha,
+                "commit_date": commit_date,  # Store for incremental lookups
                 "files": res.files,
                 "typescript_imports": res.typescript_imports,
                 "javascript_imports": res.javascript_imports,
