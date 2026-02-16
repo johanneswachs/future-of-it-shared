@@ -1016,24 +1016,26 @@ def main():
         # Fetch PRs sorted by updated_at descending for early-break optimization
         prs = retry_network_operation(lambda: list(repo.get_pulls(state='all', sort='updated', direction='desc')))
         total_prs = len(prs)
-        print(f"  Found {total_prs} PRs to process")
 
-        processed_count = 0
-        skipped_old = 0
-
-        for i, pr in enumerate(prs, 1):
-            # Early break if PR is older than cutoff (PRs are sorted by updated_at desc)
-            if is_incremental and cutoff_date:
+        # Find cutoff index if incremental
+        prs_to_process = total_prs
+        if is_incremental and cutoff_date:
+            for idx, pr in enumerate(prs):
                 pr_updated = pr.updated_at
                 if pr_updated and pr_updated.tzinfo is None:
                     pr_updated = pr_updated.replace(tzinfo=timezone.utc)
                 if pr_updated and pr_updated < cutoff_date:
-                    skipped_old = total_prs - i + 1
-                    print(f"\r  processed {processed_count}/{total_prs} PRs (skipping {skipped_old} older PRs)...", end="", flush=True)
+                    prs_to_process = idx
                     break
+            print(f"  Found {total_prs} PRs total, will process {prs_to_process} (skipping {total_prs - prs_to_process} older)")
+        else:
+            print(f"  Found {total_prs} PRs to process")
 
-            processed_count += 1
-            print(f"\r  processed {processed_count}/{total_prs} PRs...", end="", flush=True)
+        for i in range(prs_to_process):
+            pr = prs[i]
+
+            if i > 0 and i % 50 == 0:
+                print(f"\r  Processing PRs: {i}/{prs_to_process}...", end="", flush=True)
 
             # Collect PR data (now including updated_at for future incremental runs)
             pulls_rows.append({
@@ -1068,7 +1070,7 @@ def main():
                     "type": "review"
                 })
 
-        print()  # New line after progress tracking
+        print(f"\r  Processing PRs: {prs_to_process}/{prs_to_process} - done")
 
         # Save to staging folder
         pd.DataFrame(pulls_rows).to_csv(pulls_staging_file, index=False)
@@ -1131,8 +1133,9 @@ def main():
         total_issues = len(issues)
         print(f"  Found {total_issues} issues to process")
 
-        for i, issue in enumerate(issues, 1):
-            print(f"\r  processed {i}/{total_issues} issues...", end="", flush=True)
+        for i, issue in enumerate(issues):
+            if i > 0 and i % 50 == 0:
+                print(f"\r  Processing issues: {i}/{total_issues}...", end="", flush=True)
 
             # Collect issue data (now including updated_at for future incremental runs)
             issues_rows.append({
@@ -1158,7 +1161,7 @@ def main():
                     "created_at": comment.created_at
                 })
 
-        print()  # New line after progress tracking
+        print(f"\r  Processing issues: {total_issues}/{total_issues} - done")
 
         # Save to staging folder
         pd.DataFrame(issues_rows).to_csv(issues_staging_file, index=False)
