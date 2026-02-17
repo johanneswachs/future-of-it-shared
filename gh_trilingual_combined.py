@@ -121,13 +121,22 @@ def merge_csv(main_file: str, delta_file: str, key_columns: List[str], upsert: b
     If upsert=True, existing records with matching keys are replaced by delta records.
     """
     if os.path.exists(main_file):
-        existing = pd.read_csv(main_file)
-        existing_count = len(existing)
+        try:
+            existing = pd.read_csv(main_file)
+            existing_count = len(existing)
+        except pd.errors.EmptyDataError:
+            # File exists but is empty
+            existing = pd.DataFrame()
+            existing_count = 0
     else:
         existing = pd.DataFrame()
         existing_count = 0
 
-    delta = pd.read_csv(delta_file)
+    try:
+        delta = pd.read_csv(delta_file)
+    except pd.errors.EmptyDataError:
+        print(f"    Delta file is empty, nothing to merge")
+        return
     delta_count = len(delta)
 
     if delta.empty:
