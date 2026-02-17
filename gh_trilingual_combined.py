@@ -711,6 +711,8 @@ def main():
     parser = argparse.ArgumentParser(description='Collect GitHub organization data with incremental support')
     parser.add_argument('--skip-merge', action='store_true',
                         help='Skip the merge pass (staged data stays in gh_outputs_current/, main data unchanged)')
+    parser.add_argument('--merge-only', action='store_true',
+                        help='Only run merge pass (no data collection)')
     parser.add_argument('--full-fetch', action='store_true',
                         help='Force full fetch, ignore existing data')
     parser.add_argument('--since', type=str, default=None,
@@ -759,7 +761,16 @@ def main():
     print(f"  Main data folder:    {output_folder}/")
     print(f"  Staging folder:      {staging_folder}/")
     print(f"  Skip merge:          {args.skip_merge}")
+    print(f"  Merge only:          {args.merge_only}")
     print()
+
+    # Merge-only mode: just run merge and exit
+    if args.merge_only:
+        print("[Merge Only] Running merge pass...")
+        merge_all(staging_folder, output_folder)
+        elapsed = time.time() - start_time
+        print(f"\n[Merge Only] Completed in {elapsed:.1f}s")
+        return
 
     local_root = os.path.join(output_folder, "local_repos")
     os.makedirs(local_root, exist_ok=True)

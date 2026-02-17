@@ -380,6 +380,8 @@ def main():
                         help="Use incremental mode (analyze only weeks with new commits)")
     parser.add_argument("--skip-merge", action="store_true",
                         help="Skip merge pass (keep deltas in staging)")
+    parser.add_argument("--merge-only", action="store_true",
+                        help="Only run merge pass (no data collection)")
     parser.add_argument("--full-fetch", action="store_true",
                         help="Force full re-analysis of all weeks")
     parser.add_argument("--force", action="store_true",
@@ -414,6 +416,14 @@ def main():
     staging_folder = args.staging
     main_folder = args.output
     os.makedirs(main_folder, exist_ok=True)
+
+    # Merge-only mode: just run merge and exit
+    if args.merge_only:
+        print("[deps] Running merge pass only...")
+        merge_all_deps(staging_folder, main_folder)
+        elapsed = time.time() - start_time
+        print(f"\n[deps] Merge completed in {elapsed:.1f}s")
+        return
 
     # Process repos
     for r in org.get_repos():
