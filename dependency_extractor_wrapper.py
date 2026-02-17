@@ -26,10 +26,11 @@ def get_week_key_from_date(commit_date_str: str) -> str:
     return f"{iso_year}-W{iso_week:02d}"
 
 
-def get_affected_weeks_from_delta(staging_folder: str, repo_name: str) -> Dict[str, Tuple[str, datetime]]:
+def get_affected_weeks_from_delta(staging_folder: str, repo_name: str) -> Dict[str, List[Tuple[str, datetime]]]:
     """
     Read staged commits and determine which ISO weeks are affected.
-    Returns: {week_key: (sha, commit_date)} for affected weeks.
+    Returns: {week_key: [(sha, commit_date), ...]} - all commits per week, sorted newest first.
+    This allows fallback to alternate commits if the latest one is not in local clone.
     """
     commits_file = os.path.join(staging_folder, f"{repo_name}_commits.csv")
     if not os.path.exists(commits_file):
@@ -44,7 +45,8 @@ def get_affected_weeks_from_delta(staging_folder: str, repo_name: str) -> Dict[s
     if df.empty or 'sha' not in df.columns or 'commit.author.date' not in df.columns:
         return {}
 
-    affected_weeks: Dict[str, Tuple[str, datetime]] = {}
+    # Collect ALL commits per week
+    affected_weeks: Dict[str, List[Tuple[str, datetime]]] = {}
 
     for _, row in df.iterrows():
         sha = row['sha']
@@ -53,12 +55,16 @@ def get_affected_weeks_from_delta(staging_folder: str, repo_name: str) -> Dict[s
             iso_year, iso_week, _ = commit_date.isocalendar()
             week_key = f"{iso_year}-W{iso_week:02d}"
 
-            # Keep the latest commit for each week
-            if week_key not in affected_weeks or commit_date > affected_weeks[week_key][1]:
-                affected_weeks[week_key] = (sha, commit_date)
+            if week_key not in affected_weeks:
+                affected_weeks[week_key] = []
+            affected_weeks[week_key].append((sha, commit_date))
         except Exception as e:
             print(f"[deps] Warning: Could not parse date for commit {sha}: {e}")
             continue
+
+    # Sort each week's commits by date descending (newest first)
+    for week_key in affected_weeks:
+        affected_weeks[week_key].sort(key=lambda x: x[1], reverse=True)
 
     return affected_weeks
 
@@ -98,27 +104,35 @@ def load_existing_deps(main_folder: str, repo_name: str) -> Dict[str, Tuple[str,
 
 
 def get_weeks_to_analyze(
-    affected_weeks: Dict[str, Tuple[str, datetime]],
+    affected_weeks: Dict[str, List[Tuple[str, datetime]]],
     existing_weeks: Dict[str, Tuple[str, datetime]],
-) -> Dict[str, Tuple[str, datetime]]:
+) -> Dict[str, List[Tuple[str, datetime]]]:
     """
     Determine which weeks need (re-)analysis.
     Rules:
     1. New week (in affected, not in existing): Analyze
     2. Updated week (delta has NEWER commit by date): Re-analyze
     3. Unchanged week (existing commit is same or newer): Skip
-    """
-    weeks_to_analyze: Dict[str, Tuple[str, datetime]] = {}
 
-    for week_key, (delta_sha, delta_date) in affected_weeks.items():
+    Returns all candidate commits per week (sorted newest first) so we can
+    fallback to alternates if the latest commit is not in local clone.
+    """
+    weeks_to_analyze: Dict[str, List[Tuple[str, datetime]]] = {}
+
+    for week_key, commits in affected_weeks.items():
+        if not commits:
+            continue
+        # Latest commit is first in list
+        delta_sha, delta_date = commits[0]
+
         if week_key not in existing_weeks:
-            weeks_to_analyze[week_key] = (delta_sha, delta_date)
-            print(f"[deps] Week {week_key}: NEW (sha={delta_sha[:8]})")
+            weeks_to_analyze[week_key] = commits
+            print(f"[deps] Week {week_key}: NEW (sha={delta_sha[:8]}, {len(commits)} candidate(s))")
         else:
             existing_sha, existing_date = existing_weeks[week_key]
             if delta_date > existing_date:
-                weeks_to_analyze[week_key] = (delta_sha, delta_date)
-                print(f"[deps] Week {week_key}: UPDATE (newer commit {delta_sha[:8]} > {existing_sha[:8]})")
+                weeks_to_analyze[week_key] = commits
+                print(f"[deps] Week {week_key}: UPDATE (newer commit {delta_sha[:8]} > {existing_sha[:8]}, {len(commits)} candidate(s))")
             else:
                 print(f"[deps] Week {week_key}: SKIP (existing {existing_sha[:8]} is up-to-date)")
 
@@ -162,25 +176,48 @@ def backfill_commit_dates(repo_path: str, deps_file: str) -> bool:
 
 def analyze_weeks(
     analyzer: GitCommitAnalyzer,
-    weeks_to_analyze: Dict[str, Tuple[str, datetime]],
+    weeks_to_analyze: Dict[str, List[Tuple[str, datetime]]],
 ) -> List[Dict]:
     """
     Analyze specific commits for affected weeks.
+    Tries multiple commits per week if the first one is not in local clone.
     """
     results = []
     total = len(weeks_to_analyze)
+    skipped_weeks = 0
 
-    for i, (week_key, (sha, commit_date)) in enumerate(weeks_to_analyze.items(), 1):
-        print(f"[deps] Analyzing {week_key} ({i}/{total}, sha={sha[:8]})...")
-        result = analyzer.analyze_commit(sha)
-        results.append({
-            "sha": result.sha,
-            "commit_date": commit_date.isoformat(),
-            "files": result.files,
-            "typescript_imports": result.typescript_imports,
-            "javascript_imports": result.javascript_imports,
-            "swift_imports": result.swift_imports,
-        })
+    for i, (week_key, commits) in enumerate(weeks_to_analyze.items(), 1):
+        analyzed = False
+
+        for attempt, (sha, commit_date) in enumerate(commits):
+            if attempt == 0:
+                print(f"[deps] Analyzing {week_key} ({i}/{total}, sha={sha[:8]})...")
+            else:
+                print(f"[deps]   Trying alternate commit {attempt+1}/{len(commits)} (sha={sha[:8]})...")
+
+            try:
+                result = analyzer.analyze_commit(sha)
+                results.append({
+                    "sha": result.sha,
+                    "commit_date": commit_date.isoformat(),
+                    "files": result.files,
+                    "typescript_imports": result.typescript_imports,
+                    "javascript_imports": result.javascript_imports,
+                    "swift_imports": result.swift_imports,
+                })
+                analyzed = True
+                break  # Success, move to next week
+            except RuntimeError as e:
+                # Commit doesn't exist in local clone (force-pushed, deleted branch, etc.)
+                print(f"[deps]   Commit {sha[:8]} not in local clone, trying next...")
+                continue
+
+        if not analyzed:
+            print(f"[deps] WARNING: Could not analyze {week_key} - no valid commits found in local clone")
+            skipped_weeks += 1
+
+    if skipped_weeks:
+        print(f"[deps] Skipped {skipped_weeks} week(s) - no commits available in local clone")
 
     return results
 
@@ -263,8 +300,15 @@ def run_incremental_deps(
     staging_folder: str,
     main_folder: str,
     workdir: str = "deps_work",
+    force: bool = False,
 ) -> None:
     """Run incremental dependency analysis for a single repo."""
+
+    # Step 0: Skip if delta already exists (resumable)
+    delta_file = os.path.join(staging_folder, f"{repo_name}_deps_weekly_delta.json")
+    if os.path.exists(delta_file) and not force:
+        print(f"[deps] Delta already exists for {repo_name}, skipping")
+        return
 
     # Step 1: Get affected weeks from staged commits
     affected_weeks = get_affected_weeks_from_delta(staging_folder, repo_name)
@@ -338,6 +382,8 @@ def main():
                         help="Skip merge pass (keep deltas in staging)")
     parser.add_argument("--full-fetch", action="store_true",
                         help="Force full re-analysis of all weeks")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-analyze even if delta already exists (override skip-existing)")
     parser.add_argument("--staging", default="gh_outputs_current",
                         help="Staging folder for incremental data (default: gh_outputs_current)")
     parser.add_argument("--output", default="gh_outputs",
@@ -385,6 +431,7 @@ def main():
                 staging_folder=staging_folder,
                 main_folder=main_folder,
                 workdir=args.workdir,
+                force=args.force,
             )
         else:
             # Full mode: run full analysis (original behavior)
