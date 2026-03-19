@@ -204,6 +204,8 @@ def analyze_weeks(
                     "typescript_imports": result.typescript_imports,
                     "javascript_imports": result.javascript_imports,
                     "swift_imports": result.swift_imports,
+                    "csharp_imports": result.csharp_imports,
+                    "cpp_imports": result.cpp_imports,
                 })
                 analyzed = True
                 break  # Success, move to next week

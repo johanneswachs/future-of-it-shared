@@ -57,6 +57,8 @@ class CommitResult:
     typescript_imports: Dict[str, List[str]]
     javascript_imports: Dict[str, List[str]]
     swift_imports: Dict[str, List[str]]
+    csharp_imports: Dict[str, List[str]]
+    cpp_imports: Dict[str, List[str]]
 
 class GitCommitAnalyzer:
     def __init__(self, repo_url: str, workdir: str = "deps_work"):
@@ -166,6 +168,15 @@ class GitCommitAnalyzer:
     def is_swift_file(p: str) -> bool:
         return p.lower().endswith(".swift")
 
+    @staticmethod
+    def is_csharp_file(p: str) -> bool:
+        return p.lower().endswith(".cs")
+
+    @staticmethod
+    def is_cpp_file(p: str) -> bool:
+        p = p.lower()
+        return p.endswith((".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx"))
+
     # ------------ import extractors ------------
     ts_import_re = re.compile(
         r"(?:(?:import\s+[^;]+?from\s+['\"]([^'\"]+)['\"])|(?:import\s+['\"]([^'\"]+)['\"]))",
@@ -173,6 +184,11 @@ class GitCommitAnalyzer:
     )
     js_import_re = ts_import_re
     swift_import_re = re.compile(r"^\s*import\s+([A-Za-z0-9_\.]+)", re.MULTILINE)
+    csharp_import_re = re.compile(
+        r"^\s*(?:global\s+)?using\s+(?:static\s+)?(?:[A-Za-z_]\w*\s*=\s*)?([A-Za-z_][\w.]*)\s*;",
+        re.MULTILINE,
+    )
+    cpp_import_re = re.compile(r'^\s*#\s*include\s+[<"]([^>"]+)[>"]', re.MULTILINE)
 
     @classmethod
     def extract_typescript_imports(cls, text: str) -> Set[str]:
@@ -198,12 +214,22 @@ class GitCommitAnalyzer:
     def extract_swift_imports(cls, text: str) -> Set[str]:
         return set(m.group(1) for m in cls.swift_import_re.finditer(text))
 
+    @classmethod
+    def extract_csharp_imports(cls, text: str) -> Set[str]:
+        return set(m.group(1) for m in cls.csharp_import_re.finditer(text))
+
+    @classmethod
+    def extract_cpp_imports(cls, text: str) -> Set[str]:
+        return set(m.group(1) for m in cls.cpp_import_re.finditer(text))
+
     # ------------ main analysis ------------
     def analyze_commit(self, sha: str) -> 'CommitResult':
         files = self.list_files_at_commit(sha)
         ts_imports: Dict[str, List[str]] = {}
         js_imports: Dict[str, List[str]] = {}
         swift_imports: Dict[str, List[str]] = {}
+        csharp_imports: Dict[str, List[str]] = {}
+        cpp_imports: Dict[str, List[str]] = {}
 
         for fp in files:
             try:
@@ -225,6 +251,18 @@ class GitCommitAnalyzer:
                         mods = self.extract_swift_imports(content)
                         if mods:
                             swift_imports[fp] = sorted(mods)
+                elif self.is_csharp_file(fp):
+                    content = self.get_file_content_at_commit(sha, fp)
+                    if content:
+                        mods = self.extract_csharp_imports(content)
+                        if mods:
+                            csharp_imports[fp] = sorted(mods)
+                elif self.is_cpp_file(fp):
+                    content = self.get_file_content_at_commit(sha, fp)
+                    if content:
+                        mods = self.extract_cpp_imports(content)
+                        if mods:
+                            cpp_imports[fp] = sorted(mods)
             except Exception:
                 continue
 
@@ -234,6 +272,8 @@ class GitCommitAnalyzer:
             typescript_imports=ts_imports,
             javascript_imports=js_imports,
             swift_imports=swift_imports,
+            csharp_imports=csharp_imports,
+            cpp_imports=cpp_imports,
         )
 
     def analyze_commits(self, commits: List[str]) -> List[Dict]:
@@ -250,6 +290,8 @@ class GitCommitAnalyzer:
                 "typescript_imports": res.typescript_imports,
                 "javascript_imports": res.javascript_imports,
                 "swift_imports": res.swift_imports,
+                "csharp_imports": res.csharp_imports,
+                "cpp_imports": res.cpp_imports,
             })
         print()  # New line after progress tracking
         return results
@@ -269,7 +311,7 @@ class GitCommitAnalyzer:
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Local commit dependency analysis for TS/JS/Swift files.")
+    parser = argparse.ArgumentParser(description="Local commit dependency analysis for TS/JS/Swift/C#/C++ files.")
     parser.add_argument("repo", help="HTTPS clone URL")
     parser.add_argument("--out", default="deps.json", help="Output JSON file")
     parser.add_argument("--limit", type=int, default=None, help="Optional commit limit for testing")
