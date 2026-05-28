@@ -20,12 +20,10 @@ import os
 from datetime import datetime
 from requests.auth import HTTPBasicAuth
 
-# ── CONFIGURATION ─────────────────────────────────────────────────────────────
 JIRA_URL    = "https://cegdomain.atlassian.net"   # Jira base URL
 EMAIL       = "you@email.com"                      # Jira account email
 API_TOKEN   = "your_api_token_here"                # Jira API token
-                                                   # → https://id.atlassian.com/manage-profile/security
-
+                                                   # → https://id.atlassian.com/manage-profile/security                                                   # → https://id.atlassian.com/manage-profile/security                                                  # → https://id.atlassian.com/manage-profile/security
 # To export only specific projects, list their keys here:
 # e.g. PROJECT_FILTER = ["ABC", "DEF"]
 # Leave empty to export ALL accessible projects.
@@ -72,12 +70,12 @@ def get_issues_for_project(project_key):
     max_results = 100
 
     while True:
-        url = f"{JIRA_URL}/rest/api/3/search"
+        url = f"{JIRA_URL}/rest/api/3/search/jql"
         params = {
             "jql": f"project = {project_key} ORDER BY created ASC",
             "startAt": start_at,
             "maxResults": max_results,
-            "fields": "summary,status,priority,issuetype,reporter,assignee,created,resolutiondate,resolution"
+            "fields": "summary,status,priority,issuetype,reporter,assignee,created,resolutiondate,resolution,updated,duedate,labels,parent,issuelinks,timetracking,subtasks"
         }
         resp = requests.get(url, auth=auth, headers=headers, params=params)
         resp.raise_for_status()
@@ -119,7 +117,7 @@ def get_closed_by(issue_key):
                     to_status = (item.get("toString") or "").lower()
                     if to_status in closed_statuses:
                         author = history.get("author", {})
-                        closed_by = author.get("displayName", "")
+                        closed_by = author.get("emailAddress", "")
                         closed_at = history.get("created", "")
 
         if data.get("isLast", True):
@@ -138,6 +136,17 @@ def format_date(iso_string):
         return dt.strftime("%Y-%m-%d %H:%M")
     except Exception:
         return iso_string
+
+
+def format_issue_links(links):
+    parts = []
+    for link in links:
+        link_type = link.get("type", {})
+        if "outwardIssue" in link:
+            parts.append(f"{link_type.get('outward', 'links to')} {link['outwardIssue']['key']}")
+        elif "inwardIssue" in link:
+            parts.append(f"{link_type.get('inward', 'linked from')} {link['inwardIssue']['key']}")
+    return "; ".join(parts)
 
 
 def extract_field(fields, *keys):
@@ -170,10 +179,14 @@ def main():
             "Project Key", "Project Name",
             "Issue ID", "Summary",
             "Issue Type", "Status", "Priority",
-            "Reporter", "Created",
+            "Reporter", "Created", "Updated",
             "Assignee",
             "Closed By", "Closed At",
-            "Resolution Date", "Resolution Type"
+            "Resolution Date", "Resolution Type",
+            "Due Date", "Labels", "Parent",
+            "Issue Links",
+            "Time Estimate", "Time Remaining", "Time Spent",
+            "Subtasks"
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
@@ -195,6 +208,7 @@ def main():
                 # Who closed the issue (from changelog)
                 closed_by, closed_at = get_closed_by(issue_key)
 
+                timetracking = fields.get("timetracking") or {}
                 writer.writerow({
                     "Project Key":      key,
                     "Project Name":     name,
@@ -203,13 +217,22 @@ def main():
                     "Issue Type":       extract_field(fields, "issuetype", "name"),
                     "Status":           extract_field(fields, "status", "name"),
                     "Priority":         extract_field(fields, "priority", "name"),
-                    "Reporter":         extract_field(fields, "reporter", "displayName"),
+                    "Reporter":         extract_field(fields, "reporter", "emailAddress"),
                     "Created":          format_date(extract_field(fields, "created")),
-                    "Assignee":         extract_field(fields, "assignee", "displayName"),
+                    "Updated":          format_date(extract_field(fields, "updated")),
+                    "Assignee":         extract_field(fields, "assignee", "emailAddress"),
                     "Closed By":        closed_by or "",
                     "Closed At":        format_date(closed_at) if closed_at else "",
                     "Resolution Date":  format_date(extract_field(fields, "resolutiondate")),
                     "Resolution Type":  extract_field(fields, "resolution", "name"),
+                    "Due Date":         extract_field(fields, "duedate"),
+                    "Labels":           ", ".join(fields.get("labels") or []),
+                    "Parent":           extract_field(fields, "parent", "key"),
+                    "Issue Links":      format_issue_links(fields.get("issuelinks") or []),
+                    "Time Estimate":    timetracking.get("originalEstimate", ""),
+                    "Time Remaining":   timetracking.get("remainingEstimate", ""),
+                    "Time Spent":       timetracking.get("timeSpent", ""),
+                    "Subtasks":         ", ".join(s["key"] for s in (fields.get("subtasks") or [])),
                 })
 
                 if i % 50 == 0:
