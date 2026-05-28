@@ -1065,6 +1065,7 @@ def main():
                 "created_at": pr.created_at,
                 "updated_at": pr.updated_at,
                 "merged_at": pr.merged_at,
+                "merged_by": pr.merged_by.login if pr.merged_by else None,
                 "files_impacted": getattr(pr, "changed_files", None)
             })
 
@@ -1157,6 +1158,18 @@ def main():
             if i > 0 and i % 50 == 0:
                 print(f"\r  Processing issues: {i}/{total_issues}...", end="", flush=True)
 
+            # Fetch closed_by from timeline for closed issues
+            closed_by = None
+            if issue.state == "closed":
+                try:
+                    timeline = retry_network_operation(lambda: list(issue.get_timeline()))
+                    for event in reversed(timeline):
+                        if event.event == "closed":
+                            closed_by = event.actor.login if event.actor else None
+                            break
+                except Exception as e:
+                    print(f"\n  Warning: could not fetch timeline for issue #{issue.number}: {e}")
+
             # Collect issue data (now including updated_at for future incremental runs)
             issues_rows.append({
                 "repo": repo.full_name,
@@ -1168,7 +1181,8 @@ def main():
                 "state": issue.state,
                 "created_at": issue.created_at,
                 "updated_at": issue.updated_at,
-                "closed_at": issue.closed_at
+                "closed_at": issue.closed_at,
+                "closed_by": closed_by
             })
 
             # Collect issue comments
